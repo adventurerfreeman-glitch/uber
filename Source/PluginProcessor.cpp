@@ -1,137 +1,257 @@
+
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+// ============================================================
+// UBERKNALL PREAMP
+// Prototype 0.2 - Saturation Test
+//
+// STANDARD = Default
+// HIGH GAIN = Increased nonlinear saturation
+//
+// No tone stack.
+// No post-drive EQ.
+// Output level independent of saturation.
+// ============================================================
+
 UberknallPreampAudioProcessor::UberknallPreampAudioProcessor()
-    : AudioProcessor (BusesProperties()
-        .withInput ("Input", juce::AudioChannelSet::stereo(), true)
-        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters (*this, nullptr, "PARAMETERS", createParameterLayout())
+    : AudioProcessor(
+        BusesProperties()
+            .withInput(
+                "Input",
+                juce::AudioChannelSet::stereo(),
+                true)
+            .withOutput(
+                "Output",
+                juce::AudioChannelSet::stereo(),
+                true)),
+      parameters(
+          *this,
+          nullptr,
+          "PARAMETERS",
+          createParameterLayout())
 {
 }
+
+// ============================================================
+// PARAMETERS
+// ============================================================
 
 juce::AudioProcessorValueTreeState::ParameterLayout
 UberknallPreampAudioProcessor::createParameterLayout()
 {
     using namespace juce;
+
     std::vector<std::unique_ptr<RangedAudioParameter>> p;
-    p.push_back (std::make_unique<AudioParameterFloat> ("drive", "Drive",
-        NormalisableRange<float> (0.0f, 10.0f, 0.01f), 5.0f));
-    p.push_back (std::make_unique<AudioParameterFloat> ("output", "Output",
-        NormalisableRange<float> (-24.0f, 12.0f, 0.01f), -3.0f));
-    // false is the default: Standard mode.
-    p.push_back (std::make_unique<AudioParameterBool> ("highGain", "High Gain", false));
+
+    p.push_back(
+        std::make_unique<AudioParameterFloat>(
+            "drive",
+            "Drive",
+            NormalisableRange<float>(0.0f, 10.0f, 0.01f),
+            5.0f));
+
+    p.push_back(
+        std::make_unique<AudioParameterFloat>(
+            "output",
+            "Output",
+            NormalisableRange<float>(-24.0f, 12.0f, 0.01f),
+            -3.0f));
+
+    // OFF = STANDARD DEFAULT
+    p.push_back(
+        std::make_unique<AudioParameterBool>(
+            "highGain",
+            "High Gain",
+            false));
+
     return { p.begin(), p.end() };
 }
 
-void UberknallPreampAudioProcessor::prepareToPlay (double sampleRate, int)
+// ============================================================
+// PREPARATION
+// ============================================================
+
+void UberknallPreampAudioProcessor::prepareToPlay(
+    double sampleRate,
+    int samplesPerBlock)
 {
+    juce::ignoreUnused(samplesPerBlock);
+
     currentSampleRate = sampleRate;
-    for (auto& s : state) s = {};
+
+    for (auto& s : state)
+        s = {};
 }
 
-void UberknallPreampAudioProcessor::releaseResources() {}
-
-bool UberknallPreampAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+void UberknallPreampAudioProcessor::releaseResources()
 {
-    const auto in = layouts.getMainInputChannelSet();
-    const auto out = layouts.getMainOutputChannelSet();
-    return in == out && (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo());
 }
 
-float UberknallPreampAudioProcessor::onePoleLowpass (float x, float& z, float cutoff, float sr)
+// ============================================================
+// BUS LAYOUT
+// ============================================================
+
+bool UberknallPreampAudioProcessor::isBusesLayoutSupported(
+    const BusesLayout& layouts) const
 {
-    const float c = std::exp (-2.0f * juce::MathConstants<float>::pi * cutoff / sr);
-    z = (1.0f - c) * x + c * z;
-    return z;
+    const auto input = layouts.getMainInputChannelSet();
+    const auto output = layouts.getMainOutputChannelSet();
+
+    return input == output &&
+        (input == juce::AudioChannelSet::mono() ||
+         input == juce::AudioChannelSet::stereo());
 }
 
-// Smooth asymmetric transfer curve: a compact circuit-inspired stage model,
-// not a transistor-level simulation or a claim of exact component matching.
-float UberknallPreampAudioProcessor::softStage (float x, float asymmetry, float headroom)
+// ============================================================
+// NONLINEAR PREAMP STAGE
+// ============================================================
+
+float UberknallPreampAudioProcessor::processSample(
+    float x,
+    ChannelState& s,
+    float drive,
+    bool highGain,
+    float sr)
 {
-    const float driven = x / juce::jmax (0.05f, headroom);
-    const float positive = std::tanh (driven * (1.0f + asymmetry));
-    const float negative = std::tanh (driven * (1.0f - asymmetry));
-    return 0.5f * (positive + negative) * headroom;
+    juce::ignoreUnused(sr);
+
+    // Input DC rejection
+    const float input =
+        x - s.dcInX + 0.995f * s.dcInY;
+
+    s.dcInX = x;
+    s.dcInY = input;
+
+    // Drive range: 0 to 10
+    const float d =
+        juce::jlimit(0.0f, 10.0f, drive) / 10.0f;
+
+    // Fully clean at zero
+    if (d < 0.001f)
+        return input;
+
+    // High Gain changes saturation intensity,
+    // not output volume.
+    const float maximumDrive =
+        highGain ? 79.0f : 39.0f;
+
+    // Progressive nonlinear response
+    const float k =
+        1.0f + maximumDrive * std::pow(d, 2.2f);
+
+    // Normalized soft saturation.
+    // Small-signal gain remains approximately constant.
+    const float saturated =
+        std::tanh(k * input) / k;
+
+    return saturated;
 }
 
-float UberknallPreampAudioProcessor::processSample (float x, ChannelState& s,
-                                                     float drive, bool highGain, float sr)
+// ============================================================
+// AUDIO PROCESSING
+// ============================================================
+
+void UberknallPreampAudioProcessor::processBlock(
+    juce::AudioBuffer<float>& buffer,
+    juce::MidiBuffer& midiMessages)
 {
-    // Input coupling / DC rejection.
-    const float dc = x - s.dcInX + 0.995f * s.dcInY;
-    s.dcInX = x; s.dcInY = dc;
+    juce::ignoreUnused(midiMessages);
 
-    const float d = drive / 10.0f;
-    // Drive changes preamp excitation. The input signal remains consequential:
-    // a hotter external boost crosses the nonlinear knees more often.
-    const float preGain = juce::jmap (d, 1.15f, highGain ? 24.0f : 13.5f);
-    float v = dc * preGain;
-
-    // Interstage bandwidth shaping approximates coupling/feedback poles.
-    // Deliberately no amp tone stack or post-drive corrective EQ.
-    v = onePoleLowpass (v, s.low1, 10500.0f, sr);
-    v = softStage (v, 0.12f, highGain ? 0.78f : 0.92f);
-
-    // Stage 2: stronger drive in High Gain mode is distributed here,
-    // not applied as a final output multiplier.
-    v = onePoleLowpass (v, s.low2, 7600.0f, sr);
-    v = softStage (v * (highGain ? 1.85f : 1.20f), 0.20f, 0.72f);
-
-    // Stage 3: further nonlinear gain; the High Gain switch changes this
-    // stage's operating level as well as stage 2.
-    v = onePoleLowpass (v, s.low3, 6200.0f, sr);
-    v = softStage (v * (highGain ? 1.55f : 1.12f), 0.10f, 0.68f);
-
-    // Final recovery buffer: no added clipping, no tone stack.
-    const float dcFree = v - s.dcOutX + 0.9992f * s.dcOutY;
-    s.dcOutX = v; s.dcOutY = dcFree;
-    return dcFree;
-}
-
-void UberknallPreampAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
-{
     juce::ScopedNoDenormals noDenormals;
-    const int channels = juce::jmin (2, buffer.getNumChannels());
-    const float drive = parameters.getRawParameterValue ("drive")->load();
-    const float outDb = parameters.getRawParameterValue ("output")->load();
-    const bool highGain = parameters.getRawParameterValue ("highGain")->load() > 0.5f;
-    const float output = juce::Decibels::decibelsToGain (outDb);
-    const float sr = static_cast<float> (currentSampleRate);
+
+    const int channels =
+        juce::jmin(2, buffer.getNumChannels());
+
+    const float drive =
+        parameters.getRawParameterValue("drive")->load();
+
+    const float outputDb =
+        parameters.getRawParameterValue("output")->load();
+
+    const bool highGain =
+        parameters.getRawParameterValue("highGain")->load()
+        > 0.5f;
+
+    const float outputGain =
+        juce::Decibels::decibelsToGain(outputDb);
+
+    const float sr =
+        static_cast<float>(currentSampleRate);
 
     for (int ch = 0; ch < channels; ++ch)
     {
-        auto* data = buffer.getWritePointer (ch);
-        auto& st = state[static_cast<size_t> (ch)];
+        float* data = buffer.getWritePointer(ch);
+
+        auto& channelState =
+            state[static_cast<size_t>(ch)];
+
         for (int n = 0; n < buffer.getNumSamples(); ++n)
         {
-            const float y = processSample (data[n], st, drive, highGain, sr);
-            data[n] = juce::jlimit (-1.2f, 1.2f, y * output);
+            const float processed =
+                processSample(
+                    data[n],
+                    channelState,
+                    drive,
+                    highGain,
+                    sr);
+
+            data[n] = processed * outputGain;
         }
     }
-    // Clear any unexpected extra output channels.
-    for (int ch = channels; ch < buffer.getNumChannels(); ++ch)
-        buffer.clear (ch, 0, buffer.getNumSamples());
+
+    // Clear unexpected additional channels
+    for (int ch = channels;
+         ch < buffer.getNumChannels();
+         ++ch)
+    {
+        buffer.clear(ch, 0, buffer.getNumSamples());
+    }
 }
 
-juce::AudioProcessorEditor* UberknallPreampAudioProcessor::createEditor()
+// ============================================================
+// EDITOR
+// ============================================================
+
+juce::AudioProcessorEditor*
+UberknallPreampAudioProcessor::createEditor()
 {
-    return new UberknallPreampAudioProcessorEditor (*this);
+    return new UberknallPreampAudioProcessorEditor(*this);
 }
 
-void UberknallPreampAudioProcessor::getStateInformation (juce::MemoryBlock& dest)
+// ============================================================
+// SAVE / RESTORE SETTINGS
+// ============================================================
+
+void UberknallPreampAudioProcessor::getStateInformation(
+    juce::MemoryBlock& destData)
 {
     auto stateCopy = parameters.copyState();
-    std::unique_ptr<juce::XmlElement> xml (stateCopy.createXml());
-    copyXmlToBinary (*xml, dest);
+
+    std::unique_ptr<juce::XmlElement> xml(
+        stateCopy.createXml());
+
+    copyXmlToBinary(*xml, destData);
 }
 
-void UberknallPreampAudioProcessor::setStateInformation (const void* data, int size)
+void UberknallPreampAudioProcessor::setStateInformation(
+    const void* data,
+    int sizeInBytes)
 {
-    std::unique_ptr<juce::XmlElement> xml (getXmlFromBinary (data, size));
-    if (xml != nullptr && xml->hasTagName (parameters.state.getType()))
-        parameters.replaceState (juce::ValueTree::fromXml (*xml));
+    std::unique_ptr<juce::XmlElement> xml(
+        getXmlFromBinary(data, sizeInBytes));
+
+    if (xml != nullptr &&
+        xml->hasTagName(parameters.state.getType()))
+    {
+        parameters.replaceState(
+            juce::ValueTree::fromXml(*xml));
+    }
 }
+
+// ============================================================
+// PLUGIN ENTRY POINT
+// ============================================================
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
